@@ -36,6 +36,18 @@ function cleanText(value = "") {
   return value.replace(/\s+/g, " ").trim();
 }
 
+function timestamp() {
+  return new Date().toISOString();
+}
+
+function logInfo(message) {
+  console.log(`[${timestamp()}] ${message}`);
+}
+
+function logError(message) {
+  console.error(`[${timestamp()}] ${message}`);
+}
+
 function selectUrl(magazine) {
   return new URL(magazine.path, BASE_URL).toString();
 }
@@ -193,7 +205,7 @@ async function scrapeArticles(magKey) {
   const magazine = MAGAZINES[magKey];
   const startUrl = selectUrl(magazine);
 
-  console.log(`SCRAPE ${magKey}`);
+  logInfo(`SCRAPE ${magKey}`);
 
   const startHtml = await fetchHtml(startUrl);
   let articles = extractArticlesFromHtml(startHtml, magazine);
@@ -208,7 +220,7 @@ async function scrapeArticles(magKey) {
     }
   }
 
-  console.log(`${magKey}: ${articles.length} Artikel`);
+  logInfo(`${magKey}: ${articles.length} Artikel`);
 
   if (articles.length === 0) {
     throw new Error(
@@ -240,7 +252,7 @@ async function getCachedArticles(magKey) {
       .catch((error) => {
         const oldCache = articleCache.get(magKey);
         if (oldCache?.data) {
-          console.error(`[${magKey}] Scrape fehlgeschlagen, nutze Cache: ${error.message}`);
+          logError(`[${magKey}] Scrape fehlgeschlagen, nutze Cache: ${error.message}`);
           return oldCache.data;
         }
 
@@ -309,7 +321,7 @@ async function getMagazineFeed(magKey) {
       .catch((error) => {
         const oldCache = feedCache.get(cacheKey);
         if (oldCache?.xml) {
-          console.error(`[${magKey}] Feed fehlgeschlagen, nutze Cache: ${error.message}`);
+          logError(`[${magKey}] Feed fehlgeschlagen, nutze Cache: ${error.message}`);
           return oldCache.xml;
         }
 
@@ -356,7 +368,7 @@ async function getAllFeed() {
             return;
           }
 
-          console.error(`[all] ${magKey} uebersprungen: ${result.reason.message}`);
+          logError(`[all] ${magKey} uebersprungen: ${result.reason.message}`);
         });
 
         const articlesByUrl = new Map();
@@ -388,7 +400,7 @@ async function getAllFeed() {
       .catch((error) => {
         const oldCache = feedCache.get(cacheKey);
         if (oldCache?.xml) {
-          console.error(`[all] Feed fehlgeschlagen, nutze Cache: ${error.message}`);
+          logError(`[all] Feed fehlgeschlagen, nutze Cache: ${error.message}`);
           return oldCache.xml;
         }
 
@@ -421,7 +433,7 @@ app.get("/rss/all.xml", async (req, res) => {
       .type("application/rss+xml")
       .send(xml);
   } catch (error) {
-    console.error(`[all] ${error.stack || error.message}`);
+    logError(`[all] ${error.stack || error.message}`);
     res.status(502).type("text/plain").send("RSS-Feed konnte nicht erstellt werden");
   }
 });
@@ -442,16 +454,16 @@ app.get("/rss/:mag.xml", async (req, res) => {
       .type("application/rss+xml")
       .send(xml);
   } catch (error) {
-    console.error(`[${magKey}] ${error.stack || error.message}`);
+    logError(`[${magKey}] ${error.stack || error.message}`);
     res.status(502).type("text/plain").send("RSS-Feed konnte nicht erstellt werden");
   }
 });
 
 const server = app.listen(PORT, HOST, () => {
-  console.log(`[server] Läuft auf ${HOST}:${PORT}`);
+  logInfo(`[server] Läuft auf ${HOST}:${PORT}`);
 });
 
 server.on("error", (error) => {
-  console.error(`[server] Start fehlgeschlagen: ${error.message}`);
+  logError(`[server] Start fehlgeschlagen: ${error.message}`);
   process.exit(1);
 });
