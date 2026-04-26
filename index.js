@@ -6,28 +6,38 @@ const RSS = require("rss");
 const app = express();
 
 const PORT = Number(process.env.PORT) || 3000;
+const HOST = "0.0.0.0";
 const BASE_URL = "https://www.heise.de";
-const SELECT_URL = `${BASE_URL}/select/ct/`;
 const CACHE_TTL_MS = 10 * 60 * 1000;
 const REQUEST_TIMEOUT_MS = 15 * 1000;
-const USER_AGENT =
-  "Mozilla/5.0 (compatible; heise-select-rss/1.0; +https://www.heise.de/select/ct/)";
+
+const MAGAZINES = {
+  ct: { title: "c't", path: "/select/ct/" },
+  ix: { title: "iX", path: "/select/ix/" },
+  tr: { title: "Technology Review", path: "/select/tr/" },
+  make: { title: "Make", path: "/select/make/" },
+  mac: { title: "Mac & i", path: "/select/mac-and-i/" },
+  foto: { title: "c't Fotografie", path: "/select/ct-foto/" },
+};
 
 const http = axios.create({
   timeout: REQUEST_TIMEOUT_MS,
   headers: {
-    "User-Agent": USER_AGENT,
+    "User-Agent": "Mozilla/5.0",
     Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
   },
   maxRedirects: 5,
 });
 
-let cachedFeed = null;
-let cachedAt = 0;
-let refreshPromise = null;
+const articleCache = new Map();
+const feedCache = new Map();
 
 function cleanText(value = "") {
   return value.replace(/\s+/g, " ").trim();
+}
+
+function selectUrl(magazine) {
+  return new URL(magazine.path, BASE_URL).toString();
 }
 
 function normalizeUrl(href) {
@@ -45,21 +55,43 @@ function normalizeUrl(href) {
   }
 }
 
-function isArticleUrl(url) {
-  const { pathname } = new URL(url);
-  const normalizedPath = pathname.replace(/\/$/, "");
-
-  if (!normalizedPath.startsWith("/select/ct/")) return false;
-  if (/\/(archiv|abo|download|login|inhalt)(\/|$)/i.test(normalizedPath)) {
-    return false;
+function getHrefPath(href) {
+  try {
+    return new URL(href, BASE_URL).pathname;
+  } catch {
+    return "";
   }
-
-  return /^\/select\/ct\/\d{4}\/\d{1,2}\/(?:seite-\d+|[^/]+)$/.test(normalizedPath);
 }
 
-function isIssueUrl(url) {
-  const { pathname } = new URL(url);
-  return /^\/select\/ct\/\d{4}\/\d{1,2}\/?$/.test(pathname);
+function isBlockedPath(pathname) {
+  return /\/(archiv|abo|download|login|inhalt|newsletter|suche)(\/|$)/i.test(pathname);
+}
+
+function isArticleHref(href, magazine) {
+  const pathname = getHrefPath(href);
+  const normalizedPath = pathname.replace(/\/$/, "");
+  const magazinePath = magazine.path.replace(/\/$/, "");
+  const articlePattern = new RegExp(
+    `^${escapeRegExp(magazinePath)}/\\d{4}/\\d{1,2}/(?:seite-\\d+|[^/]+)$`
+  );
+
+  if (!pathname.startsWith(magazine.path)) return false;
+  if (isBlockedPath(normalizedPath)) return false;
+  if (href.endsWith("/") || pathname.endsWith("/")) return false;
+
+  return articlePattern.test(normalizedPath);
+}
+
+function isIssueHref(href, magazine) {
+  const pathname = getHrefPath(href);
+  const magazinePath = magazine.path.replace(/\/$/, "");
+
+  if (!pathname.startsWith(magazine.path)) return false;
+  return new RegExp(`^${escapeRegExp(magazinePath)}/\\d{4}/\\d{1,2}/?$`).test(pathname);
+}
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function isUsefulTitle(title) {
@@ -104,48 +136,49 @@ async function fetchHtml(url) {
 
 function extractTitle($, anchor) {
   const $anchor = $(anchor);
-  const title = cleanText($anchor.attr("title") || "");
-  const heading = cleanText($anchor.find("h1,h2,h3,h4").first().text());
-  const text = cleanText($anchor.text());
+  const candidates = [
+    $anchor.find("h1,h2,h3,h4").first().text(),
+    $anchor.attr("title") || "",
+    $anchor.text(),
+  ];
 
-  return [heading, title, text].find(isUsefulTitle) || "";
+  return candidates.map(cleanText).find(isUsefulTitle) || "";
 }
 
-async function getArticles() {
-  const overviewHtml = await fetchHtml(SELECT_URL);
-  const $overview = cheerio.load(overviewHtml);
-  const issueUrls = new Map();
+function findLatestIssueUrl($, magazine) {
+  const issues = new Map();
 
-  $overview("a[href*='/select/ct/']").each((_, element) => {
-    const url = normalizeUrl($overview(element).attr("href"));
-    if (!url || !isIssueUrl(url)) return;
+  $(`a[href*='${magazine.path}']`).each((_, element) => {
+    const href = $(element).attr("href");
+    if (!href || !isIssueHref(href, magazine)) return;
 
-    const match = new URL(url).pathname.match(/\/select\/ct\/(\d{4})\/(\d{1,2})\/?$/);
-    if (!match) return;
+    const url = normalizeUrl(href);
+    const match = getHrefPath(href).match(/\/(\d{4})\/(\d{1,2})\/?$/);
+    if (!url || !match) return;
 
-    issueUrls.set(url, {
+    issues.set(url, {
       url,
       year: Number(match[1]),
       issue: Number(match[2]),
     });
   });
 
-  const latestIssue = [...issueUrls.values()].sort((a, b) => {
+  return [...issues.values()].sort((a, b) => {
     if (b.year !== a.year) return b.year - a.year;
     return b.issue - a.issue;
-  })[0];
+  })[0]?.url;
+}
 
-  if (!latestIssue) {
-    throw new Error(`Keine Heft-Unterseite auf ${SELECT_URL} gefunden`);
-  }
-
-  const issueHtml = await fetchHtml(latestIssue.url);
-  const $ = cheerio.load(issueHtml);
+function extractArticlesFromHtml(html, magazine) {
+  const $ = cheerio.load(html);
   const articles = new Map();
 
-  $("a[href*='/select/ct/']").each((_, element) => {
-    const url = normalizeUrl($(element).attr("href"));
-    if (!url || !isArticleUrl(url) || articles.has(url)) return;
+  $(`a[href*='${magazine.path}']`).each((_, element) => {
+    const href = $(element).attr("href");
+    if (!href || !isArticleHref(href, magazine)) return;
+
+    const url = normalizeUrl(href);
+    if (!url || articles.has(url)) return;
 
     const title = extractTitle($, element);
     if (!title) return;
@@ -153,26 +186,83 @@ async function getArticles() {
     articles.set(url, { title, url });
   });
 
-  const result = [...articles.values()];
-  console.log("Gefundene Artikel:", result.length);
+  return [...articles.values()];
+}
 
-  if (result.length === 0) {
+async function scrapeArticles(magKey) {
+  const magazine = MAGAZINES[magKey];
+  const startUrl = selectUrl(magazine);
+
+  console.log(`SCRAPE ${magKey}`);
+
+  const startHtml = await fetchHtml(startUrl);
+  let articles = extractArticlesFromHtml(startHtml, magazine);
+
+  if (articles.length === 0) {
+    const $ = cheerio.load(startHtml);
+    const issueUrl = findLatestIssueUrl($, magazine);
+
+    if (issueUrl) {
+      const issueHtml = await fetchHtml(issueUrl);
+      articles = extractArticlesFromHtml(issueHtml, magazine);
+    }
+  }
+
+  console.log(`${magKey}: ${articles.length} Artikel`);
+
+  if (articles.length === 0) {
     throw new Error(
-      `Keine Artikel auf ${latestIssue.url} gefunden. Erwartetes URL-Muster: /select/ct/YYYY/ISSUE/seite-N`
+      `Keine Artikel fuer ${magKey} gefunden. Geprueft wurde ${startUrl}; erwartet werden Links wie ${magazine.path}YYYY/ISSUE/seite-N.`
     );
   }
 
-  return result;
+  return articles;
 }
 
-async function buildFeed() {
-  const articles = await getArticles();
+async function getCachedArticles(magKey) {
+  const now = Date.now();
+  const cache = articleCache.get(magKey);
 
+  if (cache?.data && now - cache.cachedAt < CACHE_TTL_MS) {
+    return cache.data;
+  }
+
+  if (!cache?.promise) {
+    const promise = scrapeArticles(magKey)
+      .then((articles) => {
+        articleCache.set(magKey, {
+          data: articles,
+          cachedAt: Date.now(),
+          promise: null,
+        });
+        return articles;
+      })
+      .catch((error) => {
+        const oldCache = articleCache.get(magKey);
+        if (oldCache?.data) {
+          console.error(`[${magKey}] Scrape fehlgeschlagen, nutze Cache: ${error.message}`);
+          return oldCache.data;
+        }
+
+        throw error;
+      });
+
+    articleCache.set(magKey, {
+      data: cache?.data || null,
+      cachedAt: cache?.cachedAt || 0,
+      promise,
+    });
+  }
+
+  return articleCache.get(magKey).promise;
+}
+
+function buildFeedXml({ key, title, siteUrl, articles }) {
   const feed = new RSS({
-    title: "heise Select c't",
-    description: "RSS-Feed der aktuellen c't-Artikel auf heise Select",
-    feed_url: "/rss.xml",
-    site_url: SELECT_URL,
+    title,
+    description: title,
+    feed_url: `/rss/${key}.xml`,
+    site_url: siteUrl,
     language: "de",
     ttl: Math.floor(CACHE_TTL_MS / 60_000),
   });
@@ -188,59 +278,177 @@ async function buildFeed() {
   return feed.xml({ indent: true });
 }
 
-async function getCachedFeed() {
+async function getMagazineFeed(magKey) {
+  const magazine = MAGAZINES[magKey];
+  const cacheKey = `mag:${magKey}`;
   const now = Date.now();
-  if (cachedFeed && now - cachedAt < CACHE_TTL_MS) {
-    return cachedFeed;
+  const cache = feedCache.get(cacheKey);
+
+  if (cache?.xml && now - cache.cachedAt < CACHE_TTL_MS) {
+    return cache.xml;
   }
 
-  if (!refreshPromise) {
-    refreshPromise = buildFeed()
-      .then((xml) => {
-        cachedFeed = xml;
-        cachedAt = Date.now();
+  if (!cache?.promise) {
+    const promise = getCachedArticles(magKey)
+      .then((articles) => {
+        const xml = buildFeedXml({
+          key: magKey,
+          title: `heise Select ${magazine.title}`,
+          siteUrl: selectUrl(magazine),
+          articles,
+        });
+
+        feedCache.set(cacheKey, {
+          xml,
+          cachedAt: Date.now(),
+          promise: null,
+        });
+
         return xml;
       })
-      .finally(() => {
-        refreshPromise = null;
+      .catch((error) => {
+        const oldCache = feedCache.get(cacheKey);
+        if (oldCache?.xml) {
+          console.error(`[${magKey}] Feed fehlgeschlagen, nutze Cache: ${error.message}`);
+          return oldCache.xml;
+        }
+
+        throw error;
       });
+
+    feedCache.set(cacheKey, {
+      xml: cache?.xml || null,
+      cachedAt: cache?.cachedAt || 0,
+      promise,
+    });
   }
 
-  try {
-    return await refreshPromise;
-  } catch (error) {
-    if (cachedFeed) {
-      console.error(`[rss] Aktualisierung fehlgeschlagen, liefere Cache: ${error.message}`);
-      return cachedFeed;
-    }
+  return feedCache.get(cacheKey).promise;
+}
 
-    throw error;
+async function getAllFeed() {
+  const cacheKey = "all";
+  const now = Date.now();
+  const cache = feedCache.get(cacheKey);
+
+  if (cache?.xml && now - cache.cachedAt < CACHE_TTL_MS) {
+    return cache.xml;
   }
+
+  if (!cache?.promise) {
+    const promise = Promise.allSettled(
+      Object.keys(MAGAZINES).map(async (magKey) => {
+        const articles = await getCachedArticles(magKey);
+        return articles.map((article) => ({
+          ...article,
+          title: `[${MAGAZINES[magKey].title}] ${article.title}`,
+        }));
+      })
+    )
+      .then((results) => {
+        const groups = [];
+
+        results.forEach((result, index) => {
+          const magKey = Object.keys(MAGAZINES)[index];
+
+          if (result.status === "fulfilled") {
+            groups.push(result.value);
+            return;
+          }
+
+          console.error(`[all] ${magKey} uebersprungen: ${result.reason.message}`);
+        });
+
+        const articlesByUrl = new Map();
+        groups.flat().forEach((article) => {
+          if (!articlesByUrl.has(article.url)) {
+            articlesByUrl.set(article.url, article);
+          }
+        });
+
+        if (articlesByUrl.size === 0) {
+          throw new Error("Keine Artikel fuer den Kombi-Feed gefunden");
+        }
+
+        const xml = buildFeedXml({
+          key: "all",
+          title: "heise Select",
+          siteUrl: `${BASE_URL}/select/`,
+          articles: [...articlesByUrl.values()],
+        });
+
+        feedCache.set(cacheKey, {
+          xml,
+          cachedAt: Date.now(),
+          promise: null,
+        });
+
+        return xml;
+      })
+      .catch((error) => {
+        const oldCache = feedCache.get(cacheKey);
+        if (oldCache?.xml) {
+          console.error(`[all] Feed fehlgeschlagen, nutze Cache: ${error.message}`);
+          return oldCache.xml;
+        }
+
+        throw error;
+      });
+
+    feedCache.set(cacheKey, {
+      xml: cache?.xml || null,
+      cachedAt: cache?.cachedAt || 0,
+      promise,
+    });
+  }
+
+  return feedCache.get(cacheKey).promise;
 }
 
 app.set("trust proxy", true);
 app.disable("x-powered-by");
 
 app.get("/", (req, res) => {
-  res.type("text/plain").send("ok");
+  res.type("text/plain").send("RSS läuft");
 });
 
-app.get("/rss.xml", async (req, res) => {
+app.get("/rss/all.xml", async (req, res) => {
   try {
-    const xml = await getCachedFeed();
+    const xml = await getAllFeed();
     res
       .status(200)
       .set("Cache-Control", "public, max-age=600")
       .type("application/rss+xml")
       .send(xml);
   } catch (error) {
-    console.error(`[rss] Fehler: ${error.stack || error.message}`);
+    console.error(`[all] ${error.stack || error.message}`);
     res.status(502).type("text/plain").send("RSS-Feed konnte nicht erstellt werden");
   }
 });
 
-const server = app.listen(PORT, "0.0.0.0", () => {
-  console.log(`[server] Läuft auf Port ${PORT}`);
+app.get("/rss/:mag.xml", async (req, res) => {
+  const magKey = req.params.mag;
+
+  if (!MAGAZINES[magKey]) {
+    res.status(404).type("text/plain").send("Unbekanntes Magazin");
+    return;
+  }
+
+  try {
+    const xml = await getMagazineFeed(magKey);
+    res
+      .status(200)
+      .set("Cache-Control", "public, max-age=600")
+      .type("application/rss+xml")
+      .send(xml);
+  } catch (error) {
+    console.error(`[${magKey}] ${error.stack || error.message}`);
+    res.status(502).type("text/plain").send("RSS-Feed konnte nicht erstellt werden");
+  }
+});
+
+const server = app.listen(PORT, HOST, () => {
+  console.log(`[server] Läuft auf ${HOST}:${PORT}`);
 });
 
 server.on("error", (error) => {
