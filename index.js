@@ -158,27 +158,27 @@ function extractTitle($, anchor) {
 }
 
 function findLatestIssueUrl($, magazine) {
-  const issues = new Map();
+  // Heise orders its issue overview editorially. Issue numbers (including
+  // special editions) are identifiers, not a reliable publication chronology.
+  const selectors = [
+    ".magazines--issues a.magazine__cover-link",
+    ".magazines--issues a.magazine__link--issue",
+    "main a[href]",
+    "a[href]",
+  ];
 
-  $(`a[href*='${magazine.path}']`).each((_, element) => {
-    const href = $(element).attr("href");
-    if (!href || !isIssueHref(href, magazine)) return;
-
-    const url = normalizeUrl(href);
-    const match = getHrefPath(href).match(/\/(\d{4})\/(\d{1,2})\/?$/);
-    if (!url || !match) return;
-
-    issues.set(url, {
-      url,
-      year: Number(match[1]),
-      issue: Number(match[2]),
+  for (const selector of selectors) {
+    let issueUrl;
+    $(selector).each((_, element) => {
+      const href = $(element).attr("href");
+      if (!href || !isIssueHref(href, magazine)) return;
+      const url = normalizeUrl(href);
+      if (!url) return;
+      issueUrl = url;
+      return false;
     });
-  });
-
-  return [...issues.values()].sort((a, b) => {
-    if (b.year !== a.year) return b.year - a.year;
-    return b.issue - a.issue;
-  })[0]?.url;
+    if (issueUrl) return issueUrl;
+  }
 }
 
 function extractArticlesFromHtml(html, magazine) {
@@ -208,17 +208,10 @@ async function scrapeArticles(magKey) {
   logInfo(`SCRAPE ${magKey}`);
 
   const startHtml = await fetchHtml(startUrl);
-  let articles = extractArticlesFromHtml(startHtml, magazine);
-
-  if (articles.length === 0) {
-    const $ = cheerio.load(startHtml);
-    const issueUrl = findLatestIssueUrl($, magazine);
-
-    if (issueUrl) {
-      const issueHtml = await fetchHtml(issueUrl);
-      articles = extractArticlesFromHtml(issueHtml, magazine);
-    }
-  }
+  const issueUrl = findLatestIssueUrl(cheerio.load(startHtml), magazine);
+  const articles = issueUrl
+    ? extractArticlesFromHtml(await fetchHtml(issueUrl), magazine)
+    : extractArticlesFromHtml(startHtml, magazine);
 
   logInfo(`${magKey}: ${articles.length} Artikel`);
 
@@ -251,6 +244,7 @@ async function getCachedArticles(magKey) {
       })
       .catch((error) => {
         const oldCache = articleCache.get(magKey);
+        if (oldCache) oldCache.promise = null;
         if (oldCache?.data) {
           logError(`[${magKey}] Scrape fehlgeschlagen, nutze Cache: ${error.message}`);
           return oldCache.data;
@@ -320,6 +314,7 @@ async function getMagazineFeed(magKey) {
       })
       .catch((error) => {
         const oldCache = feedCache.get(cacheKey);
+        if (oldCache) oldCache.promise = null;
         if (oldCache?.xml) {
           logError(`[${magKey}] Feed fehlgeschlagen, nutze Cache: ${error.message}`);
           return oldCache.xml;
@@ -399,6 +394,7 @@ async function getAllFeed() {
       })
       .catch((error) => {
         const oldCache = feedCache.get(cacheKey);
+        if (oldCache) oldCache.promise = null;
         if (oldCache?.xml) {
           logError(`[all] Feed fehlgeschlagen, nutze Cache: ${error.message}`);
           return oldCache.xml;

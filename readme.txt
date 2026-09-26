@@ -37,3 +37,13 @@ http://localhost:3000/rss/all.xml
 Beispiel Deployment:
 https://deine-domain.example/rss/ct.xml
 https://deine-domain.example/rss/all.xml
+
+Auswahl und Reihenfolge:
+Die zuerst in Heises Heftübersicht vorgestellte Ausgabe wird geladen.
+Heftnummern werden nicht chronologisch sortiert, da Sonderhefte davon
+abweichen können. Ohne Heftübersicht gilt die Linkreihenfolge auf der Seite.
+Sind keine Heftlinks vorhanden, werden die Artikel der Startseite verwendet.
+Die Artikel bleiben in der Reihenfolge der jeweiligen Quellseite.
+
+Tests:
+npm test
